@@ -68,6 +68,7 @@
 #include <haproxy/lb_fwlc.h>
 #include <haproxy/lb_fwrr.h>
 #include <haproxy/lb_map.h>
+#include <haproxy/lb_n2sl.h>
 #include <haproxy/lb_ss.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
@@ -3818,6 +3819,9 @@ out_uri_auth_compat:
 		 */
 
 		curproxy->lbprm.algo &= ~(BE_LB_LKUP | BE_LB_PROP_DYN);
+		fprintf(stderr, "[N2SL] before switch: proxy=%s algo=0x%x cap=0x%x KIND=0x%x\n", 
+        curproxy->id, curproxy->lbprm.algo, curproxy->cap,
+        curproxy->lbprm.algo & BE_LB_KIND);
 		switch (curproxy->lbprm.algo & BE_LB_KIND) {
 		case BE_LB_KIND_RR:
 			if ((curproxy->lbprm.algo & BE_LB_PARM) == BE_LB_RR_STATIC) {
@@ -3860,6 +3864,13 @@ out_uri_auth_compat:
 				curproxy->lbprm.algo |= BE_LB_PROP_DYN;
 				init_server_ss(curproxy);
 			}
+			break;
+
+		//n2sl: No Need, No Param, Only algorithm is set to bit field
+		case BE_LB_KIND_N2SL:
+			fprintf(stderr, "[N2SL] check_config_validity: calling n2sl_init_server_tree\n");
+			curproxy->lbprm.algo |= BE_LB_LKUP_NSTREE;
+			n2sl_init_server_tree(curproxy);
 			break;
 		}
 		HA_RWLOCK_INIT(&curproxy->lbprm.lock);

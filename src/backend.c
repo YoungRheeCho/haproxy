@@ -41,6 +41,7 @@
 #include <haproxy/lb_fwrr.h>
 #include <haproxy/lb_map.h>
 #include <haproxy/lb_ss.h>
+#include <haproxy/lb_n2sl.h>
 #include <haproxy/log.h>
 #include <haproxy/namespace.h>
 #include <haproxy/obj_type.h>
@@ -785,6 +786,11 @@ int assign_server(struct stream *s)
 			case BE_LB_HASH_SMP:
 				/* sample expression hashing */
 				srv = get_server_expr(s, prev_srv);
+				break;
+			
+			case BE_LB_LKUP_NSTREE: /*n2sl algorithm lookup tree: ebtree*/
+				fprintf(stderr, "[N2SL] assign_server: dispatching to n2sl_get_next_server\n");
+				srv = n2sl_get_next_server(s->be);
 				break;
 
 			default:
@@ -3265,8 +3271,16 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 		curproxy->lbprm.algo &= ~BE_LB_ALGO;
 		curproxy->lbprm.algo |= BE_LB_ALGO_SS;
 	}
+
+	//n2sl: Parsing parsing n2sl lb algo bitmask
+	else if(strcmp(args[0], "n2sl") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_N2SL;
+		fprintf(stderr, "[N2SL] balance n2sl parsed, algo bit set\n");
+	}
+
 	else {
-		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hash', 'hdr(name)', 'rdp-cookie(name)', 'log-hash' and 'sticky' options.");
+		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hash', 'hdr(name)', 'rdp-cookie(name)', 'log-hash', 'sticky' and 'n2sl' options.");
 		return -1;
 	}
 	return 0;

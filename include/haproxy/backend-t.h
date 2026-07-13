@@ -29,6 +29,7 @@
 #include <haproxy/lb_fwrr-t.h>
 #include <haproxy/lb_map-t.h>
 #include <haproxy/lb_ss-t.h>
+#include <haproxy/lb_n2sl-t.h>
 #include <haproxy/server-t.h>
 #include <haproxy/thread-t.h>
 
@@ -78,6 +79,7 @@
 #define BE_LB_KIND_CB   0x00020000  /* connection-based */
 #define BE_LB_KIND_HI   0x00030000  /* hash of input (see hash inputs above) */
 #define BE_LB_KIND_SA   0x00040000  /* standalone (specific algorithms, cannot be grouped) */
+#define BE_LB_KIND_N2SL 0x00050000 	/*N2SL: New Algorithm*/
 #define BE_LB_KIND      0x00070000  /* mask to get/clear LB algorithm */
 
 /* All known variants of load balancing algorithms. These can be cleared using
@@ -99,6 +101,9 @@
 #define BE_LB_ALGO_LH	(BE_LB_KIND_HI | BE_LB_NEED_LOG  | BE_LB_HASH_SMP) /* log hash: sample expression  */
 #define BE_LB_ALGO      (BE_LB_KIND    | BE_LB_NEED      | BE_LB_PARM    ) /* mask to clear algo */
 
+//N2SL LoadBalance Algotithm
+#define BE_LB_ALGO_N2SL	(BE_LB_KIND_N2SL| BE_LB_NEED_NONE)
+
 /* Higher bits define how a given criterion is mapped to a server. In fact it
  * designates the LB function by itself. The dynamic algorithms will also have
  * the DYN bit set. These flags are automatically set at the end of the parsing.
@@ -109,6 +114,7 @@
 #define BE_LB_LKUP_LCTREE 0x00300000  /* FWLC tree lookup */
 #define BE_LB_LKUP_CHTREE 0x00400000  /* consistent hash  */
 #define BE_LB_LKUP_FSTREE 0x00500000  /* FAS tree lookup */
+#define BE_LB_LKUP_NSTREE 0x00600000  /* N2SL tree look up*/
 #define BE_LB_LKUP        0x00700000  /* mask to get just the LKUP value */
 
 /* additional properties */
@@ -159,6 +165,7 @@ struct lbprm {
 		struct lb_chash chash;
 		struct lb_fas fas;
 		struct lb_ss ss;
+		struct lb_n2sl n2sl;
 	};
 	uint32_t algo;			/* load balancing algorithm and variants: BE_LB_* */
 	int tot_wact, tot_wbck;		/* total effective weights of active and backup servers */
