@@ -39,6 +39,7 @@ static inline void n2sl_queue_srv(struct server *s)
 /*
 srv_lb_status_changed 체크 → srv_willbe_usable면 스킵 → WRLOCK → srv_currently_usable면 스킵 → (ToDo)실제 제거  → unlock → srv_lb_commit_status
 */
+//ToDo: 서버가 죽었을 때, look up table(alive server list)를 공유해야함
 static void n2sl_set_server_status_down(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
@@ -96,7 +97,7 @@ out_update_backend:
 	srv_lb_commit_status(srv);
 }
 
-
+//ToDo: 서버가 살아났을 때, look up table(alive server list)를 공유해야함
 static void n2sl_set_server_status_up(struct server *srv){
 	struct proxy *p = srv->proxy;
 
