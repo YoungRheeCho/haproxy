@@ -5,6 +5,9 @@
 #include <haproxy/server-t.h>
 #include <haproxy/global.h>
 #include <haproxy/lb_n2sl.h>
+#include <collector/shared_types.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 /*
 1. init function
@@ -95,6 +98,7 @@ out_update_backend:
 
  out_update_state:
 	srv_lb_commit_status(srv);
+	atomic_store(&shm_servers[srv->n2sl_shm_idx].status, srv_willbe_usable(srv) ? SERVER_STATUS_UP : SERVER_STATUS_DOWN);
 }
 
 //ToDo: 서버가 살아났을 때, look up table(alive server list)를 공유해야함
@@ -149,6 +153,7 @@ static void n2sl_set_server_status_up(struct server *srv){
 	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 
  out_update_state:
+	atomic_store(&shm_servers[srv->n2sl_shm_idx].status, srv_willbe_usable(srv) ? SERVER_STATUS_UP : SERVER_STATUS_DOWN);
 	srv_lb_commit_status(srv);
 }
 
@@ -157,7 +162,21 @@ void n2sl_init_server_tree(struct proxy *p)
 	fprintf(stderr, "[N2SL] init_server_tree: proxy=%s\n", p->id);
 	struct server *srv;
 	struct eb_root init_head = EB_ROOT;
-	
+
+
+	//ToDo: backend count 관리하는 전역변수 생성 및 snprintf 0 대신 넣기
+    char shm_name[64];
+    snprintf(shm_name, sizeof(shm_name), "/n2sl_backend_%d", 0);
+
+    int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+    if (fd == -1) {
+        fprintf(stderr, "[N2SL] shm_open 실패: %s\n", shm_name);
+        // 에러 처리 방식은 기존 HAProxy 관례에 맞춰서 (여기선 일단 리턴 생략)
+    }
+    ftruncate(fd, sizeof(ServerSlot) * MAX_SERVERS);
+    ServerSlot* shm_servers = mmap(NULL, sizeof(ServerSlot) * MAX_SERVERS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+									
+    // shm_servers, fd를 이 backend(p)와 연결해서 보관해야 함 — p->lbprm.n2sl 쪽에 필드 추가 필요해 보임
 	/*load balancer interface 목록*/
 	/* Call backs for some actions. Any of them may be NULL (thus should be ignored).
 	 * Those marked "srvlock" will need to be called with the server lock held.
@@ -182,13 +201,26 @@ void n2sl_init_server_tree(struct proxy *p)
 	p->lbprm.n2sl.act = init_head;
 	p->lbprm.n2sl.bck = init_head;
 
+	int slot_idx = 0;
 	/* queue active and backup servers in two distinct groups */
 	for (srv = p->srv; srv; srv = srv->next) {
+		if (slot_idx >= MAX_SERVERS) {
+			fprintf(stderr, "[N2SL] 서버 개수가 MAX_SERVERS(%d)를 초과함, 나머지는 shm에 못 씀\n", MAX_SERVERS);
+			break;
+		}
+		addr_to_str(&srv->addr, shm_servers[slot_idx].ip, sizeof(shm_servers[slot_idx].ip));
+		shm_servers[slot_idx].port = srv->svc_port;
+		atomic_store(&shm_servers[slot_idx].status, SERVER_STATUS_UP);
+		/* 나중에 up/down 콜백에서 이 서버가 몇 번 슬롯이었는지 찾을 수 있게 저장 */
+		srv->n2sl_shm_idx = slot_idx;
+		slot_idx++;
+
 		if (!srv_currently_usable(srv))
 			continue;
 		srv->lb_tree = (srv->flags & SRV_F_BACKUP) ? &p->lbprm.fas.bck : &p->lbprm.fas.act;
 		n2sl_queue_srv(srv);
 	}
+
 }
 
 struct server *n2sl_get_next_server(struct proxy *p)
