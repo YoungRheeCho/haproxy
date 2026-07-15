@@ -438,6 +438,7 @@ struct server {
 	unsigned lb_nodes_now;                  /* number of lb_nodes placed in the tree (C-HASH) */
 	enum srv_hash_key hash_key;             /* method to compute node hash (C-HASH) */
 	unsigned lb_server_key;                 /* hash of the values indicated by "hash_key" (C-HASH) */
+	int n2sl_shm_idx;						//n2sl server index
 
 	const struct netns_entry *netns;        /* contains network namespace name or NULL. Network namespace comes from configuration */
 	struct xprt_ops *xprt;                  /* transport-layer operations */
