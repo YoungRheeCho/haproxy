@@ -22,6 +22,8 @@ static inline void n2sl_queue_srv(struct server *s);
 static void n2sl_set_server_status_down(struct server *srv);
 static void n2sl_set_server_status_up(struct server *srv);
 
+ServerSlot* shm_servers = NULL;
+
 //server는 lb_tree를 통해서 act/back을 판단함
 static inline void n2sl_remove_from_tree(struct server *s)
 {
@@ -174,7 +176,7 @@ void n2sl_init_server_tree(struct proxy *p)
         // 에러 처리 방식은 기존 HAProxy 관례에 맞춰서 (여기선 일단 리턴 생략)
     }
     ftruncate(fd, sizeof(ServerSlot) * MAX_SERVERS);
-    ServerSlot* shm_servers = mmap(NULL, sizeof(ServerSlot) * MAX_SERVERS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    shm_servers = mmap(NULL, sizeof(ServerSlot) * MAX_SERVERS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 									
     // shm_servers, fd를 이 backend(p)와 연결해서 보관해야 함 — p->lbprm.n2sl 쪽에 필드 추가 필요해 보임
 	/*load balancer interface 목록*/
