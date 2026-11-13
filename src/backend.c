@@ -707,7 +707,11 @@ int assign_server(struct stream *s)
 		case BE_LB_LKUP_LCTREE:
 			srv = fwlc_get_next_server(s->be, prev_srv);
 			break;
-
+		
+		case BE_LB_LKUP_NSTREE: /*n2sl algorithm lookup tree: ebtree*/
+            srv = n2sl_get_next_server(s->be);
+            break;
+		
 		case BE_LB_LKUP_CHTREE:
 		case BE_LB_LKUP_MAP:
 			if ((s->be->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR) {
@@ -786,11 +790,6 @@ int assign_server(struct stream *s)
 			case BE_LB_HASH_SMP:
 				/* sample expression hashing */
 				srv = get_server_expr(s, prev_srv);
-				break;
-			
-			case BE_LB_LKUP_NSTREE: /*n2sl algorithm lookup tree: ebtree*/
-				fprintf(stderr, "[N2SL] assign_server: dispatching to n2sl_get_next_server\n");
-				srv = n2sl_get_next_server(s->be);
 				break;
 
 			default:

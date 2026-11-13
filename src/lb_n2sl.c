@@ -8,6 +8,12 @@
 #include <collector/shared_types.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <haproxy/n2sl_table.h>
+#include <haproxy/tools.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <string.h>
 
 /*
 1. init function
@@ -100,7 +106,9 @@ out_update_backend:
 
  out_update_state:
 	srv_lb_commit_status(srv);
-	atomic_store(&shm_servers[srv->n2sl_shm_idx].status, srv_willbe_usable(srv) ? SERVER_STATUS_UP : SERVER_STATUS_DOWN);
+	if (shm_servers){
+		atomic_store(&shm_servers[srv->n2sl_shm_idx].status, srv_willbe_usable(srv) ? SERVER_STATUS_UP : SERVER_STATUS_DOWN);
+	}
 }
 
 //ToDo: 서버가 살아났을 때, look up table(alive server list)를 공유해야함
@@ -155,7 +163,9 @@ static void n2sl_set_server_status_up(struct server *srv){
 	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 
  out_update_state:
-	atomic_store(&shm_servers[srv->n2sl_shm_idx].status, srv_willbe_usable(srv) ? SERVER_STATUS_UP : SERVER_STATUS_DOWN);
+	if (shm_servers){
+		atomic_store(&shm_servers[srv->n2sl_shm_idx].status, srv_willbe_usable(srv) ? SERVER_STATUS_UP : SERVER_STATUS_DOWN);
+	}
 	srv_lb_commit_status(srv);
 }
 
@@ -170,13 +180,18 @@ void n2sl_init_server_tree(struct proxy *p)
     char shm_name[64];
     snprintf(shm_name, sizeof(shm_name), "/n2sl_backend_%d", 0);
 
+    shm_servers = NULL;
     int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
     if (fd == -1) {
         fprintf(stderr, "[N2SL] shm_open 실패: %s\n", shm_name);
-        // 에러 처리 방식은 기존 HAProxy 관례에 맞춰서 (여기선 일단 리턴 생략)
+    } else {
+        if (ftruncate(fd, sizeof(ServerSlot) * MAX_SERVERS) == 0) {
+            void *m = mmap(NULL, sizeof(ServerSlot) * MAX_SERVERS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED)
+                shm_servers = m;
+        }
+        close(fd);
     }
-    ftruncate(fd, sizeof(ServerSlot) * MAX_SERVERS);
-    shm_servers = mmap(NULL, sizeof(ServerSlot) * MAX_SERVERS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 									
     // shm_servers, fd를 이 backend(p)와 연결해서 보관해야 함 — p->lbprm.n2sl 쪽에 필드 추가 필요해 보임
 	/*load balancer interface 목록*/
@@ -192,9 +207,13 @@ void n2sl_init_server_tree(struct proxy *p)
 	//p->lbprm.server_deinit = ;				/* to be called when we're destroying the server */
 	p->lbprm.set_server_status_up   = n2sl_set_server_status_up; /* to be called after status changes to UP // srvlock */
 	p->lbprm.set_server_status_down = n2sl_set_server_status_down; /* to be called after status changes to DOWN // srvlock */
-	
 
 	//This function recounts the number of usable active and backup servers for proxy <p>
+	p->lbprm.wdiv = BE_WEIGHT_SCALE;
+	for (srv = p->srv; srv; srv = srv->next) {
+		srv->next_eweight = (srv->uweight * p->lbprm.wdiv + p->lbprm.wmult - 1) / p->lbprm.wmult;
+		srv_lb_commit_status(srv);
+	}
 	recount_servers(p);
 	/* This function simply updates the backend's tot_weight and tot_used values after servers weights have been updated.*/
 	update_backend_weight(p);
@@ -210,31 +229,150 @@ void n2sl_init_server_tree(struct proxy *p)
 			fprintf(stderr, "[N2SL] 서버 개수가 MAX_SERVERS(%d)를 초과함, 나머지는 shm에 못 씀\n", MAX_SERVERS);
 			break;
 		}
-		addr_to_str(&srv->addr, shm_servers[slot_idx].ip, sizeof(shm_servers[slot_idx].ip));
-		shm_servers[slot_idx].port = srv->svc_port;
-		atomic_store(&shm_servers[slot_idx].status, SERVER_STATUS_UP);
+		if (shm_servers) {
+			addr_to_str(&srv->addr, shm_servers[slot_idx].ip, sizeof(shm_servers[slot_idx].ip));
+			shm_servers[slot_idx].port = srv->svc_port;
+			atomic_store(&shm_servers[slot_idx].status, SERVER_STATUS_UP);
+		}
 		/* 나중에 up/down 콜백에서 이 서버가 몇 번 슬롯이었는지 찾을 수 있게 저장 */
 		srv->n2sl_shm_idx = slot_idx;
 		slot_idx++;
 
-		if (!srv_currently_usable(srv))
+		if (!srv_currently_usable(srv)){
 			continue;
+		}
 		srv->lb_tree = (srv->flags & SRV_F_BACKUP) ? &p->lbprm.fas.bck : &p->lbprm.fas.act;
 		n2sl_queue_srv(srv);
 	}
 
 }
 
+/* ===== 모델 표로 서버 고르기 ===== */
+struct n2sl_shm {
+        const n2sl_table_t *tbl;
+        n2sl_assign_t      *asg;
+};
+
+static struct n2sl_shm *n2sl_shm_p;   /* 한 번 열면 계속 사용 */
+static unsigned int n2sl_rr;          /* round robin 순번 */
+
+static int64_t n2sl_now_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Collector가 만든 공유메모리를 연다. 아직 없으면 NULL을 돌려주고, 다음 요청 때 다시 시도한다 */
+static struct n2sl_shm *n2sl_get_shm(void)
+{
+        struct n2sl_shm *s = __atomic_load_n(&n2sl_shm_p, __ATOMIC_ACQUIRE);
+        if (s)
+                return s;
+
+        struct stat st1, st2;
+        int fd1 = shm_open("/n2sl_table", O_RDONLY, 0);
+        if (fd1 < 0)
+                return NULL;
+        int fd2 = shm_open("/n2sl_assign", O_RDWR, 0);
+        if (fd2 < 0) {
+                close(fd1);
+                return NULL;
+        }
+        /* Collector가 크기를 정하기 전이면 mmap하지 않는다 (작은 파일을 매핑하면 SIGBUS) */
+        if (fstat(fd1, &st1) || fstat(fd2, &st2) ||
+            st1.st_size < (off_t)sizeof(n2sl_table_t) || st2.st_size < (off_t)sizeof(n2sl_assign_t)) {
+                close(fd1); close(fd2);
+                return NULL;
+        }
+        void *t = mmap(NULL, sizeof(n2sl_table_t), PROT_READ, MAP_SHARED, fd1, 0);
+        void *a = mmap(NULL, sizeof(n2sl_assign_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd2, 0);
+        close(fd1); close(fd2);
+        s = malloc(sizeof(*s));
+        if (t == MAP_FAILED || a == MAP_FAILED || !s) {
+                if (t != MAP_FAILED) munmap(t, sizeof(n2sl_table_t));
+                if (a != MAP_FAILED) munmap(a, sizeof(n2sl_assign_t));
+                free(s);
+                return NULL;
+        }
+        s->tbl = t;
+        s->asg = a;
+
+        /* 스레드 2개가 동시에 열었으면 먼저 등록한 쪽을 쓰고 내 것은 버린다 */
+        struct n2sl_shm *expect = NULL;
+        if (!__atomic_compare_exchange_n(&n2sl_shm_p, &expect, s, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                munmap((void *)s->tbl, sizeof(n2sl_table_t));
+                munmap(s->asg, sizeof(n2sl_assign_t));
+                free(s);
+                return expect;
+        }
+        return s;
+}
+
+/* 모델 표로 고른다. 판단할 수 없으면 NULL을 돌려준다 */
+static struct server *n2sl_model_pick(struct proxy *p)
+{
+        struct n2sl_shm *s = n2sl_get_shm();
+        if (!s)
+                return NULL;                                  /* 표 없음 */
+
+        const n2sl_table_t *t = s->tbl;
+        struct server *map[N2SL_MAX_SRV] = { NULL };
+        unsigned char alive[N2SL_MAX_SRV] = { 0 };
+        uint32_t n = t->n_srv < N2SL_MAX_SRV ? t->n_srv : N2SL_MAX_SRV;
+        char ip[64];
+        struct server *srv;
+
+        for (srv = p->srv; srv; srv = srv->next) {
+                if (!srv_currently_usable(srv) || (srv->flags & SRV_F_BACKUP))
+                        continue;
+                if (addr_to_str(&srv->addr, ip, sizeof(ip)) < 0)
+                        return NULL;
+                int found = -1;
+                for (uint32_t i = 0; i < n; i++) {
+                        if (strncmp(t->srv[i].key, ip, N2SL_KEY_LEN) == 0) {
+                                found = (int)i;
+                                break;
+                        }
+                }
+                if (found < 0)
+                        return NULL;                              /* 표에 없는 서버가 있음 */
+                map[found] = srv;
+                alive[found] = 1;
+        }
+
+        int k = n2sl_pick(t, s->asg, alive, n2sl_now_ms(), 3000);   /* 3초보다 오래된 표면 -1 */
+        return k >= 0 ? map[k] : NULL;
+}
+
+/* 판단할 수 없을 때 쓰는 round robin */
+static struct server *n2sl_rr_pick(struct proxy *p)
+{
+        struct server *list[N2SL_MAX_SRV];
+        struct server *srv;
+        int n = 0;
+
+        for (srv = p->srv; srv && n < N2SL_MAX_SRV; srv = srv->next)
+                if (srv_currently_usable(srv) && !(srv->flags & SRV_F_BACKUP))
+                        list[n++] = srv;
+        if (!n)
+                return NULL;
+        return list[HA_ATOMIC_FETCH_ADD(&n2sl_rr, 1) % n];
+}
+
 struct server *n2sl_get_next_server(struct proxy *p)
 {
-	fprintf(stderr, "[N2SL] get_next_server: called\n");
 	struct server *srv = NULL;
-	fprintf(stderr, "[N2SL] get_next_server called\n");
 
 	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
 
 	//active server 중에서 선택	
-	if (p->srv_act){}
+	if (p->srv_act) {
+        srv = n2sl_model_pick(p);
+        if (!srv)
+            srv = n2sl_rr_pick(p);
+        goto out;
+    }
 
 	//active server 중에서 alive가 없을 경우 first backup server를 선택
 	else if (p->lbprm.fbck) {
@@ -255,7 +393,6 @@ struct server *n2sl_get_next_server(struct proxy *p)
 
   out:
 	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
-	fprintf(stderr, "[N2SL] get_next_server: returning %s\n", srv ? srv->id : "NULL");
 	return srv;
 }
 
